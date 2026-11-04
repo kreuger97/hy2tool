@@ -5,21 +5,30 @@ Hysteria 2 server installer and manager.
 ## Install
 
 Run these steps in a root shell on a Linux server with systemd. The release
-below is for x86-64 (amd64). The installer also needs `bash`, `curl`, `openssl`
-and `ufw`; `wget` is an alternative for downloading the manager.
+below is for x86-64 (amd64). Before changing the server, the installer checks
+for `bash`, `curl`, `openssl`, `chmod`, `systemctl` and `journalctl`. Missing
+required commands stop installation with a complete list of dependencies to
+install. `wget` is an alternative for downloading the manager; the installer
+itself still requires `curl`.
+
+`ufw` is optional. If available, the installer adds inbound rules for the
+Hysteria UDP port and enabled masquerade TCP ports. If absent, firewall setup
+is reported as skipped with a manual configuration reminder and the exact
+ports to allow. Configure your firewall/security group yourself in that case;
+for the default ports with masquerade enabled: UDP 443, TCP 80 and TCP 443.
 
 1. Download the manager using **one** of these commands.
 
    With curl:
 
    ```bash
-   curl -fsSL -o hy2tool https://github.com/kreuger97/hy2-installer/releases/latest/download/hy2tool_linux_amd64
+   curl -fsSL -o hy2tool https://github.com/kreuger97/hy2tool/releases/latest/download/hy2tool_linux_amd64
    ```
 
    Or with wget:
 
    ```bash
-   wget -O hy2tool https://github.com/kreuger97/hy2-installer/releases/latest/download/hy2tool_linux_amd64
+   wget -O hy2tool https://github.com/kreuger97/hy2tool/releases/latest/download/hy2tool_linux_amd64
    ```
 
 2. Make the downloaded file executable.
@@ -54,6 +63,22 @@ existing units and masks are preserved. The upstream installer script is downloa
 to a temporary file over HTTPS and runs only after a successful, non-empty
 download. The temporary file is removed on success and failure.
 
+## Reinstall
+
+Running `./hy2tool install` again detects a previous installation from the
+Hysteria executable, server configuration, certificates or systemd unit.
+Before asking for new settings, it warns that full reinstallation will stop
+the server and replace the executable, configuration, certificates and main
+systemd unit. Only an explicit `y` authorizes this; Enter defaults to refusal
+and exits without changes.
+
+After approval, dependencies are checked before stopping the old service.
+The upstream installer is run with `--force`, new configuration and certificates
+are generated, the main systemd unit is recreated, and the service is restarted
+so the new settings take effect. Existing clients may need a new password,
+port or certificate settings. Systemd drop-in overrides are retained.
+To update the executable while keeping your settings, use `./hy2tool update`.
+
 ## Commands
 
 | Command | Description |
@@ -72,7 +97,7 @@ download. The temporary file is removed on success and failure.
 - Self-signed SSL certificate
 - Masquerade proxy (optional)
 - Bandwidth limits
-- Firewall configuration (ufw)
+- Optional firewall configuration through ufw, with manual setup guidance when unavailable
 - Automatic creation of a missing `hysteria-server.service` (existing units and masks are preserved)
 - Random password generation
 

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -34,6 +35,8 @@ type state int
 
 const (
 	stateWelcome state = iota
+	stateInspectInstallation
+	stateConfirmReinstall
 	stateAskPort
 	stateAskPassword
 	stateAskMasquerade
@@ -66,6 +69,7 @@ type task struct {
 }
 
 type model struct {
+	reinstall    bool
 	state        state
 	cfg          config.Config
 	tasks        []task
@@ -148,7 +152,9 @@ func initialModel() model {
 	}
 }
 
+type installationDetectedMsg struct{ found bool }
 type taskDoneMsg struct{}
+type taskSkippedMsg struct{ reason string }
 type taskErrMsg struct{ err error }
 
 func (m model) Init() tea.Cmd {
@@ -156,13 +162,14 @@ func (m model) Init() tea.Cmd {
 }
 
 func (m *model) buildTasks() {
-	installed := install.HysteriaInstalled()
 	m.taskIdx = -1
-	m.tasks = []task{{name: "Install Hysteria 2"}}
-	if installed {
-		m.tasks[0].status = taskSkipped
-		m.tasks[0].reason = "already installed"
+	m.tasks = []task{{name: "Check Dependencies"}}
+	if m.reinstall {
+		m.tasks = append(m.tasks, task{name: "Stop Previous Service"}, task{name: "Reinstall Hysteria 2"})
+	} else {
+		m.tasks = append(m.tasks, task{name: "Install Hysteria 2"})
 	}
+
 	m.tasks = append(m.tasks,
 		task{name: "Generate SSL Certificate"},
 		task{name: "Write Server Config"},
@@ -170,6 +177,17 @@ func (m *model) buildTasks() {
 		task{name: "Start & Enable Service"},
 		task{name: "Configure Firewall"},
 	)
+	if m.reinstall {
+		for i := range m.tasks {
+			switch m.tasks[i].name {
+			case "Ensure systemd Service":
+				m.tasks[i].name = "Recreate systemd Service"
+			case "Start & Enable Service":
+				m.tasks[i].name = "Restart & Enable Service"
+			}
+		}
+	}
+
 }
 
 func (m model) currentTask() *task {
@@ -201,6 +219,45 @@ func (m *model) startNextTask() tea.Cmd {
 
 	var cmd tea.Cmd
 	switch t.name {
+	case "Check Dependencies":
+		cmd = func() tea.Msg {
+			if err := install.CheckDependencies(); err != nil {
+				return taskErrMsg{err}
+			}
+			return taskDoneMsg{}
+		}
+	case "Stop Previous Service":
+		cmd = func() tea.Msg {
+			if err := install.StopForReinstall(); err != nil {
+				var skipped *install.SkippedError
+				if errors.As(err, &skipped) {
+					return taskSkippedMsg{reason: skipped.Reason}
+				}
+				return taskErrMsg{err}
+			}
+			return taskDoneMsg{}
+		}
+	case "Reinstall Hysteria 2":
+		cmd = func() tea.Msg {
+			if err := install.ReinstallHysteria(); err != nil {
+				return taskErrMsg{err}
+			}
+			return taskDoneMsg{}
+		}
+	case "Recreate systemd Service":
+		cmd = func() tea.Msg {
+			if err := install.RecreateService(); err != nil {
+				return taskErrMsg{err}
+			}
+			return taskDoneMsg{}
+		}
+	case "Restart & Enable Service":
+		cmd = func() tea.Msg {
+			if err := install.RestartService(); err != nil {
+				return taskErrMsg{err}
+			}
+			return taskDoneMsg{}
+		}
 	case "Install Hysteria 2":
 		cmd = func() tea.Msg {
 			if err := install.InstallHysteria(); err != nil {
@@ -239,6 +296,10 @@ func (m *model) startNextTask() tea.Cmd {
 	case "Configure Firewall":
 		cmd = func() tea.Msg {
 			if err := install.ConfigureFirewall(m.cfg); err != nil {
+				var skipped *install.SkippedError
+				if errors.As(err, &skipped) {
+					return taskSkippedMsg{reason: skipped.Reason}
+				}
 				return taskErrMsg{err}
 			}
 			return taskDoneMsg{}
@@ -305,6 +366,19 @@ func yesNo(val string) bool {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case installationDetectedMsg:
+		if m.state != stateInspectInstallation {
+			return m, nil
+		}
+		if msg.found {
+			m.state = stateConfirmReinstall
+			m.yesNoInp.SetValue("")
+			m.yesNoInp.Focus()
+			return m, textinput.Blink
+		}
+		m.state = stateAskPort
+		m.portInp.Focus()
+		return m, textinput.Blink
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -314,7 +388,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
-			if m.state == stateWelcome || m.state == stateSummary {
+			if m.state == stateWelcome || m.state == stateSummary || m.state == stateConfirmReinstall || m.state == stateInspectInstallation {
 				return m, tea.Quit
 			}
 		}
@@ -326,12 +400,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case stateWelcome:
 			if msg.String() == "enter" {
 				m.cfg = config.Default()
-				m.state = stateAskPort
+				m.reinstall = false
+				m.state = stateInspectInstallation
 				m.portInp.SetValue(m.cfg.Port)
-				m.portInp.Focus()
-				return m, textinput.Blink
+				return m, func() tea.Msg { return installationDetectedMsg{found: install.PreviousInstallation()} }
 			}
 
+		case stateConfirmReinstall:
+			switch msg.String() {
+			case "enter":
+				if !yesNo(m.yesNoInp.Value()) {
+					m.state = stateExit
+					return m, tea.Quit
+				}
+				m.reinstall = true
+				m.state = stateAskPort
+				m.portInp.Focus()
+				return m, textinput.Blink
+			case "esc":
+				m.state = stateWelcome
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.yesNoInp, cmd = m.yesNoInp.Update(msg)
+			return m, cmd
 		case stateAskPort:
 			switch msg.String() {
 			case "enter":
@@ -523,10 +615,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	case taskDoneMsg:
+	case taskDoneMsg, taskSkippedMsg:
 		t := m.currentTask()
 		if t != nil {
-			t.status = taskDone
+			if skipped, ok := msg.(taskSkippedMsg); ok {
+				t.status, t.reason = taskSkipped, skipped.reason
+			} else {
+				t.status = taskDone
+			}
 		}
 		if m.allTasksDone() {
 			m.serverIP = getOutboundIP()
@@ -566,6 +662,12 @@ func (m model) View() string {
 	}
 
 	switch m.state {
+	case stateInspectInstallation:
+		return "\nChecking for an existing Hysteria installation..."
+	case stateConfirmReinstall:
+		input := m.yesNoInp
+		input.Placeholder = "n"
+		return m.askYesNoView("Confirm Full Reinstallation", "Existing Hysteria installation detected.\nThe server will be stopped. The binary, config,\ncertificates and main systemd unit will be replaced.\nExisting clients may need new connection settings.\nContinue with full reinstallation?", input, "y/N")
 	case stateWelcome:
 		return m.welcomeView()
 	case stateAskPort:

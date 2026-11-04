@@ -55,7 +55,11 @@ func HysteriaInstalled() bool {
 	return err == nil
 }
 
-func InstallHysteria() error {
+func InstallHysteria() error { return installHysteria(false) }
+
+func ReinstallHysteria() error { return installHysteria(true) }
+
+func installHysteria(force bool) error {
 	script, err := os.CreateTemp("", "hy2-install-*.sh")
 	if err != nil {
 		return fmt.Errorf("create installer script: %w", err)
@@ -76,7 +80,11 @@ func InstallHysteria() error {
 	if info.Size() == 0 {
 		return fmt.Errorf("downloaded installer script is empty")
 	}
-	if err := runCommand(exec.Command("bash", path)); err != nil {
+	args := []string{path}
+	if force {
+		args = append(args, "--force")
+	}
+	if err := runCommand(exec.Command("bash", args...)); err != nil {
 		return fmt.Errorf("run installer: %w", err)
 	}
 	return nil
@@ -165,20 +173,28 @@ func EnsureService() error {
 	return ensureService("/etc/systemd/system", exec.LookPath)
 }
 
+func RecreateService() error { return writeService("/etc/systemd/system", exec.LookPath, true) }
+
 func ensureService(dir string, lookPath func(string) (string, error)) error {
-	out, err := commandOutput(exec.Command("systemctl", "show", "hysteria-server.service", "--property=LoadState", "--value"))
-	state := strings.TrimSpace(out)
-	if err != nil {
-		var failure *CommandError
-		if state != "not-found" || !errors.As(err, &failure) || failure.ExitCode != 1 {
-			return fmt.Errorf("inspect Hysteria service: %w", err)
+	return writeService(dir, lookPath, false)
+}
+
+func writeService(dir string, lookPath func(string) (string, error), replace bool) error {
+	if !replace {
+		out, err := commandOutput(exec.Command("systemctl", "show", "hysteria-server.service", "--property=LoadState", "--value"))
+		state := strings.TrimSpace(out)
+		if err != nil {
+			var failure *CommandError
+			if state != "not-found" || !errors.As(err, &failure) || failure.ExitCode != 1 {
+				return fmt.Errorf("inspect Hysteria service: %w", err)
+			}
 		}
-	}
-	if state != "not-found" {
-		if state == "" {
-			return fmt.Errorf("systemd returned an empty LoadState for hysteria-server.service")
+		if state != "not-found" {
+			if state == "" {
+				return fmt.Errorf("systemd returned an empty LoadState for hysteria-server.service")
+			}
+			return nil
 		}
-		return nil
 	}
 	binary, err := lookPath("hysteria")
 	if err != nil {
@@ -215,6 +231,25 @@ WantedBy=multi-user.target
 		return fmt.Errorf("create systemd directory: %w", err)
 	}
 	path := filepath.Join(dir, "hysteria-server.service")
+	if replace {
+		temp, err := os.CreateTemp(dir, ".hysteria-service-*")
+		if err != nil {
+			return err
+		}
+		defer os.Remove(temp.Name())
+		_, writeErr := temp.WriteString(unit)
+		closeErr := temp.Close()
+		if writeErr != nil {
+			return fmt.Errorf("write replacement service: %w", writeErr)
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if err := os.Chmod(temp.Name(), 0644); err != nil {
+			return err
+		}
+		return os.Rename(temp.Name(), path)
+	}
 	// O_EXCL also protects existing symlinks, masks, and units created concurrently.
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if os.IsExist(err) {
@@ -236,10 +271,13 @@ WantedBy=multi-user.target
 	return nil
 }
 
-func StartService() error {
+func StartService() error   { return startService("start") }
+func RestartService() error { return startService("restart") }
+
+func startService(action string) error {
 	cmds := []string{
 		"systemctl daemon-reload",
-		"systemctl start hysteria-server",
+		"systemctl " + action + " hysteria-server",
 		"systemctl is-active --quiet hysteria-server",
 		"systemctl enable hysteria-server",
 	}
@@ -295,26 +333,31 @@ func waitForService(stableFor, interval time.Duration) error {
 	}
 }
 
-func ConfigureFirewall(cfg config.Config) error {
-	cmd := exec.Command("ufw", "allow", cfg.Port)
-	if err := runCommand(cmd); err != nil {
-		return err
-	}
+// SkippedError reports an optional step requiring manual action.
+type SkippedError struct{ Reason string }
 
+func (e *SkippedError) Error() string { return e.Reason }
+
+func firewallPorts(cfg config.Config) []string {
+	ports := []string{cfg.Port + "/udp"}
 	if cfg.MasqueradeEnabled {
-		if cfg.MasqueradeHTTPPort != "" {
-			port := strings.TrimPrefix(cfg.MasqueradeHTTPPort, ":")
-			cmd = exec.Command("ufw", "allow", port, "tcp")
-			if err := runCommand(cmd); err != nil {
-				return err
+		for _, listener := range []string{cfg.MasqueradeHTTPPort, cfg.MasqueradeHTTPSPort} {
+			if listener != "" {
+				ports = append(ports, strings.TrimPrefix(listener, ":")+"/tcp")
 			}
 		}
-		if cfg.MasqueradeHTTPSPort != "" {
-			port := strings.TrimPrefix(cfg.MasqueradeHTTPSPort, ":")
-			cmd = exec.Command("ufw", "allow", port, "tcp")
-			if err := runCommand(cmd); err != nil {
-				return err
-			}
+	}
+	return ports
+}
+
+func ConfigureFirewall(cfg config.Config) error {
+	ports := firewallPorts(cfg)
+	if _, err := exec.LookPath("ufw"); err != nil {
+		return &SkippedError{Reason: "ufw unavailable; manual firewall configuration required: allow inbound " + strings.Join(ports, ", ")}
+	}
+	for _, port := range ports {
+		if err := runCommand(exec.Command("ufw", "allow", port)); err != nil {
+			return err
 		}
 	}
 	return nil

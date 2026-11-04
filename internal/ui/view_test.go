@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/kreuger97/hy2tool/internal/config"
 )
@@ -165,5 +166,130 @@ func TestServiceSetupPrecedesStart(t *testing.T) {
 	m.taskIdx = setup - 1
 	if cmd := m.startNextTask(); cmd == nil || m.tasks[setup].status != taskRunning {
 		t.Fatal("service setup command missing")
+	}
+}
+
+func TestPreflightStopsBeforeInstallation(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	m := initialModel()
+	m.buildTasks()
+	m.state = stateProcessing
+	m.ready = true
+	if m.tasks[0].name != "Check Dependencies" {
+		t.Fatal("dependency check must be first")
+	}
+	command := m.startNextTask()
+	msg := command()
+	if _, ok := msg.(taskErrMsg); !ok {
+		t.Fatalf("missing commands should fail preflight: %T", msg)
+	}
+	updated, next := m.Update(msg)
+	m = updated.(model)
+	if next != nil || m.state != stateSummary || m.tasks[0].status != taskError {
+		t.Fatal("preflight did not stop installation")
+	}
+	for _, stage := range m.tasks[1:] {
+		if stage.status != taskSkipped {
+			t.Fatalf("stage ran after preflight failure: %+v", stage)
+		}
+	}
+	if !strings.Contains(m.report(), "missing required dependencies") || strings.Contains(m.View(), "Installation Complete") {
+		t.Fatal("wrong dependency failure report")
+	}
+}
+
+func TestMissingFirewallFinishesWithManualSetupReminder(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	m := initialModel()
+	m.cfg.MasqueradeEnabled = true
+	m.state = stateProcessing
+	m.ready = true
+	m.tasks = []task{{name: "Start & Enable Service", status: taskDone}, {name: "Configure Firewall"}}
+	m.taskIdx = 0
+	msg := m.startNextTask()()
+	if _, ok := msg.(taskSkippedMsg); !ok {
+		t.Fatalf("missing ufw should skip: %T", msg)
+	}
+	updated, next := m.Update(msg)
+	m = updated.(model)
+	if next != nil || m.state != stateSummary || m.errMsg != "" || m.tasks[1].status != taskSkipped {
+		t.Fatal("optional firewall blocked completion")
+	}
+	var out bytes.Buffer
+	if err := printFinalReport(&out, m, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, report := range []string{m.report(), out.String()} {
+		for _, want := range []string{"[skipped] Configure Firewall", "manual firewall configuration required", "443/udp", "80/tcp", "443/tcp"} {
+			if !strings.Contains(report, want) {
+				t.Errorf("missing %q in report: %s", want, report)
+			}
+		}
+	}
+	if !strings.Contains(m.View(), "manual") || !strings.Contains(m.View(), "ufw") {
+		t.Fatal("TUI omitted manual setup reminder")
+	}
+}
+
+func TestReinstallRequiresExplicitApproval(t *testing.T) {
+	enter := tea.KeyMsg{Type: tea.KeyEnter}
+	m := initialModel()
+	m.ready = true
+	checked, checkCmd := m.Update(enter)
+	m = checked.(model)
+	if m.state != stateInspectInstallation || checkCmd == nil || len(m.tasks) != 0 {
+		t.Fatal("installation started before detection")
+	}
+	detected, _ := m.Update(installationDetectedMsg{found: true})
+	m = detected.(model)
+	if m.state != stateConfirmReinstall || m.reinstall || len(m.tasks) != 0 {
+		t.Fatal("existing install bypassed approval")
+	}
+	if !strings.Contains(m.View(), "Confirm Full Reinstallation") || !strings.Contains(m.View(), "replaced") {
+		t.Fatal("missing destructive reinstall warning")
+	}
+	for _, answer := range []string{"", "n", "x", "y"} {
+		t.Run("answer="+answer, func(t *testing.T) {
+			candidate := m
+			candidate.yesNoInp.SetValue(answer)
+			updated, cmd := candidate.Update(enter)
+			candidate = updated.(model)
+			if answer != "y" {
+				if candidate.reinstall || candidate.state != stateExit || len(candidate.tasks) != 0 || cmd == nil {
+					t.Fatal("reinstall continued without approval")
+				}
+				if _, ok := cmd().(tea.QuitMsg); !ok {
+					t.Fatal("decline should exit without operations")
+				}
+			} else {
+				if !candidate.reinstall || candidate.state != stateAskPort || len(candidate.tasks) != 0 {
+					t.Fatal("approval did not start configuration")
+				}
+				candidate.buildTasks()
+				want := []string{"Check Dependencies", "Stop Previous Service", "Reinstall Hysteria 2", "Generate SSL Certificate", "Write Server Config", "Recreate systemd Service", "Restart & Enable Service", "Configure Firewall"}
+				if len(candidate.tasks) != len(want) {
+					t.Fatalf("wrong tasks: %+v", candidate.tasks)
+				}
+				for i, name := range want {
+					if candidate.tasks[i].name != name || candidate.tasks[i].status != taskPending {
+						t.Fatalf("reinstall stage %d: %+v", i, candidate.tasks[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestFreshInstallationDoesNotRequireReinstallApproval(t *testing.T) {
+	m := initialModel()
+	m.state = stateInspectInstallation
+	updated, _ := m.Update(installationDetectedMsg{found: false})
+	m = updated.(model)
+	if m.state != stateAskPort || m.reinstall {
+		t.Fatal("fresh install incorrectly requires reinstall")
+	}
+	m.buildTasks()
+	if m.tasks[1].name != "Install Hysteria 2" || m.tasks[1].status != taskPending {
+		t.Fatal("fresh binary install skipped")
 	}
 }

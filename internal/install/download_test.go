@@ -11,6 +11,7 @@ import (
 
 func TestInstallHysteriaDownloadAndExecution(t *testing.T) {
 	for _, tc := range []struct {
+		force                bool
 		name                 string
 		curlExit, scriptExit int
 		empty, missingCurl   bool
@@ -19,6 +20,7 @@ func TestInstallHysteriaDownloadAndExecution(t *testing.T) {
 		wantRun, wantErr     bool
 	}{
 		{name: "success", wantRun: true},
+		{name: "forced reinstall", force: true, wantRun: true},
 		{name: "HTTP failure", curlExit: 22, wantCommand: "curl", wantExit: 22, wantErr: true},
 		{name: "partial download", curlExit: 18, wantCommand: "curl", wantExit: 18, wantErr: true},
 		{name: "timeout", curlExit: 28, wantCommand: "curl", wantExit: 28, wantErr: true},
@@ -31,8 +33,10 @@ func TestInstallHysteriaDownloadAndExecution(t *testing.T) {
 			t.Setenv("TMPDIR", tempDir)
 			t.Setenv("SCRIPT_MARKER", filepath.Join(dir, "script-ran"))
 			t.Setenv("DOWNLOADED_PATH", filepath.Join(dir, "downloaded-path"))
+			t.Setenv("SCRIPT_ARGUMENTS", filepath.Join(dir, "script-arguments"))
 			t.Setenv("PAYLOAD", filepath.Join(dir, "payload"))
 			payload := fmt.Sprintf("#!/bin/bash\nprintf ran > \"$SCRIPT_MARKER\"\necho script-output\necho script-error >&2\nexit %d\n", tc.scriptExit)
+			payload = "printf '%s' \"$*\" > \"$SCRIPT_ARGUMENTS\"\n" + payload
 			if tc.empty {
 				payload = ""
 			}
@@ -60,7 +64,12 @@ exit %d
 				path = dir
 			}
 			t.Setenv("PATH", path)
-			err := InstallHysteria()
+			var err error
+			if tc.force {
+				err = ReinstallHysteria()
+			} else {
+				err = InstallHysteria()
+			}
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("error = %v, wantErr = %t", err, tc.wantErr)
 			}
@@ -77,6 +86,16 @@ exit %d
 					if failure.Stdout != prefix+"-output\n" || failure.Stderr != prefix+"-error\n" {
 						t.Fatalf("streams lost: %+v", failure)
 					}
+				}
+			}
+			if tc.wantRun {
+				args, readErr := os.ReadFile(filepath.Join(dir, "script-arguments"))
+				want := ""
+				if tc.force {
+					want = "--force"
+				}
+				if readErr != nil || string(args) != want {
+					t.Fatalf("installer args: %q %v", args, readErr)
 				}
 			}
 			_, markerErr := os.Stat(filepath.Join(dir, "script-ran"))

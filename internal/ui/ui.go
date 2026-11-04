@@ -3,6 +3,7 @@ package ui
 import (
 	"crypto/rand"
 	"fmt"
+	"io"
 	"math/big"
 	"net/url"
 	"os"
@@ -54,33 +55,35 @@ const (
 	taskRunning
 	taskDone
 	taskError
+	taskSkipped
 )
 
 type task struct {
 	name   string
 	status taskStatus
 	err    error
+	reason string
 }
 
 type model struct {
-	state    state
-	cfg      config.Config
-	tasks    []task
-	taskIdx  int
-	spinner  spinner.Model
-	portInp  textinput.Model
-	passInp  textinput.Model
-	urlInp   textinput.Model
+	state        state
+	cfg          config.Config
+	tasks        []task
+	taskIdx      int
+	spinner      spinner.Model
+	portInp      textinput.Model
+	passInp      textinput.Model
+	urlInp       textinput.Model
 	httpPortInp  textinput.Model
 	httpsPortInp textinput.Model
-	bwUpInp  textinput.Model
-	bwDownInp textinput.Model
-	yesNoInp textinput.Model
-	width    int
-	height   int
-	errMsg   string
-	ready    bool
-	serverIP string
+	bwUpInp      textinput.Model
+	bwDownInp    textinput.Model
+	yesNoInp     textinput.Model
+	width        int
+	height       int
+	errMsg       string
+	ready        bool
+	serverIP     string
 }
 
 func initialModel() model {
@@ -154,13 +157,16 @@ func (m model) Init() tea.Cmd {
 
 func (m *model) buildTasks() {
 	installed := install.HysteriaInstalled()
-	m.tasks = []task{}
-	if !installed {
-		m.tasks = append(m.tasks, task{name: "Install Hysteria 2"})
+	m.taskIdx = -1
+	m.tasks = []task{{name: "Install Hysteria 2"}}
+	if installed {
+		m.tasks[0].status = taskSkipped
+		m.tasks[0].reason = "already installed"
 	}
 	m.tasks = append(m.tasks,
 		task{name: "Generate SSL Certificate"},
 		task{name: "Write Server Config"},
+		task{name: "Ensure systemd Service"},
 		task{name: "Start & Enable Service"},
 		task{name: "Configure Firewall"},
 	)
@@ -175,7 +181,7 @@ func (m model) currentTask() *task {
 
 func (m model) allTasksDone() bool {
 	for _, t := range m.tasks {
-		if t.status != taskDone {
+		if t.status != taskDone && t.status != taskSkipped {
 			return false
 		}
 	}
@@ -184,6 +190,9 @@ func (m model) allTasksDone() bool {
 
 func (m *model) startNextTask() tea.Cmd {
 	m.taskIdx++
+	for m.taskIdx < len(m.tasks) && m.tasks[m.taskIdx].status == taskSkipped {
+		m.taskIdx++
+	}
 	if m.taskIdx >= len(m.tasks) {
 		return nil
 	}
@@ -209,6 +218,13 @@ func (m *model) startNextTask() tea.Cmd {
 	case "Write Server Config":
 		cmd = func() tea.Msg {
 			if err := install.WriteConfig(m.cfg); err != nil {
+				return taskErrMsg{err}
+			}
+			return taskDoneMsg{}
+		}
+	case "Ensure systemd Service":
+		cmd = func() tea.Msg {
+			if err := install.EnsureService(); err != nil {
 				return taskErrMsg{err}
 			}
 			return taskDoneMsg{}
@@ -302,10 +318,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 		}
+
 		if msg.String() == "q" && m.state == stateProcessing {
 			return m, tea.Quit
 		}
-
 		switch m.state {
 		case stateWelcome:
 			if msg.String() == "enter" {
@@ -525,8 +541,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			t.status = taskError
 			t.err = msg.err
 		}
+		for i := m.taskIdx + 1; i < len(m.tasks); i++ {
+			m.tasks[i].status = taskSkipped
+			m.tasks[i].reason = "previous stage failed"
+		}
 		m.errMsg = msg.err.Error()
-		m.serverIP = getOutboundIP()
 		m.state = stateSummary
 		return m, nil
 
@@ -727,6 +746,8 @@ func (m model) processingView() string {
 			line = lipgloss.NewStyle().Foreground(lipgloss.Color("69")).Render("  " + m.spinner.View() + " " + t.name)
 		case taskDone:
 			line = lipgloss.NewStyle().Foreground(lipgloss.Color("36")).Render("  ✓ " + t.name)
+		case taskSkipped:
+			line = "  − " + t.name + " (skipped: " + t.reason + ")"
 		case taskError:
 			line = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render("  ✗ " + t.name)
 		}
@@ -748,6 +769,9 @@ func (m model) processingView() string {
 }
 
 func (m model) summaryView() string {
+	if m.errMsg != "" || !m.allTasksDone() {
+		return m.report() + "\nPress Enter or q to quit"
+	}
 	var b strings.Builder
 
 	serverIP := m.serverIP
@@ -762,13 +786,8 @@ func (m model) summaryView() string {
 
 	b.WriteString(title)
 	b.WriteString("\n\n")
-
-	if m.errMsg != "" {
-		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-		b.WriteString(errStyle.Render("  Some tasks failed:\n"))
-		b.WriteString(errStyle.Render("    " + m.errMsg))
-		b.WriteString("\n\n")
-	}
+	b.WriteString(m.stageReport())
+	b.WriteString("\n")
 
 	infoStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
 	b.WriteString(infoStyle.Render("  Server:     " + serverIP))
@@ -858,20 +877,91 @@ func centerBox(box string, width int) string {
 		Render(box)
 }
 
+func (m model) stageReport() string {
+	var b strings.Builder
+	for _, t := range m.tasks {
+		label := "pending"
+		switch t.status {
+		case taskDone:
+			label = "done"
+		case taskError:
+			label = "failed"
+		case taskSkipped:
+			label = "skipped"
+		case taskRunning:
+			label = "running"
+		}
+		fmt.Fprintf(&b, "[%s] %s", label, t.name)
+		if t.reason != "" {
+			fmt.Fprintf(&b, " (%s)", t.reason)
+		}
+		b.WriteString("\n")
+		if t.err != nil {
+			fmt.Fprintf(&b, "%v\n", t.err)
+		}
+	}
+	return b.String()
+}
+
+func (m model) report() string {
+	title := "Installation Complete"
+	if m.errMsg != "" {
+		title = "Installation Failed"
+	} else if !m.allTasksDone() {
+		title = "Installation Interrupted"
+	}
+	text := title + "\n\n" + m.stageReport()
+	if m.errMsg != "" {
+		// Include errors not associated with a stage as well.
+		found := false
+		for _, t := range m.tasks {
+			if t.err != nil {
+				found = true
+			}
+		}
+		if !found {
+			text += m.errMsg + "\n"
+		}
+	}
+	if m.errMsg == "" && m.allTasksDone() {
+		text += fmt.Sprintf("\nServer: %s\nPort: %s\nPassword: %s\nMasquerade: %t (%s)\nBandwidth: ↑%s ↓%s\nClient: Hysteria 2, Allow Insecure: ON, ALPN: h3\nConnection Link: %s\n\n%s", m.serverIP, m.cfg.Port, m.cfg.Password, m.cfg.MasqueradeEnabled, m.cfg.MasqueradeURL, m.cfg.BandwidthUp, m.cfg.BandwidthDown, m.connectionURI(), m.qrCode())
+	}
+	return text
+}
+
+func printFinalReport(w io.Writer, final tea.Model, runErr error) error {
+	m, ok := final.(model)
+	if ok && len(m.tasks) > 0 {
+		if runErr != nil && m.errMsg == "" {
+			m.errMsg = runErr.Error()
+		}
+		if _, err := fmt.Fprintln(w, m.report()); err != nil {
+			return err
+		}
+		if runErr == nil && m.errMsg != "" {
+			return fmt.Errorf("installation failed: %s", m.errMsg)
+		}
+	}
+	return runErr
+}
+
 func Run() error {
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
-	_, err := p.Run()
-	return err
+	final, err := p.Run()
+	return printFinalReport(os.Stdout, final, err)
 }
 
 func RunWithSignals(sigCh <-chan os.Signal) error {
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
-
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-sigCh
-		p.Quit()
+		select {
+		case <-sigCh:
+			p.Quit()
+		case <-done:
+		}
 	}()
-
-	_, err := p.Run()
-	return err
+	final, err := p.Run()
+	return printFinalReport(os.Stdout, final, err)
 }

@@ -1,5 +1,7 @@
 FROM debian:12
 
+ARG GO_VERSION=1.27.3
+
 ENV container=docker
 
 RUN apt update && apt install -y \
@@ -15,7 +17,7 @@ RUN apt update && apt install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && ARCH=$(dpkg --print-architecture) \
-    && wget -q "https://go.dev/dl/go1.23.6.linux-${ARCH}.tar.gz" -O /tmp/go.tar.gz \
+    && wget -q "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" -O /tmp/go.tar.gz \
     && tar -C /usr/local -xzf /tmp/go.tar.gz \
     && rm /tmp/go.tar.gz
 

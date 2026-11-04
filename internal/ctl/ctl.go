@@ -20,8 +20,10 @@ Usage:
 
 Commands:
   install   Run interactive installer
+  update    Update Hysteria 2 without changing configuration
   link      Show connection link and QR code
   status    Show service status
+  logs      Show service journal (-n N, -f to follow)
   start     Start the service
   stop      Stop the service
   restart   Restart the service
@@ -209,4 +211,13 @@ func CmdService(action string) {
 		os.Exit(1)
 	}
 	fmt.Printf("\n  Service %sed successfully.\n\n", action)
+}
+
+func CmdUpdate() error {
+	fmt.Println("Updating Hysteria 2 (configuration will be preserved)...")
+	if err := install.UpdateHysteria(); err != nil {
+		return err
+	}
+	fmt.Println("Hysteria 2 updated successfully. Configuration preserved; previous service state retained.")
+	return nil
 }

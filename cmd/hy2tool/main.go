@@ -29,6 +29,16 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+	case "update":
+		if err := ctl.CmdUpdate(); err != nil {
+			fmt.Fprintf(os.Stderr, "Update failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "logs":
+		if err := ctl.CmdLogs(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Logs failed: %v\n", err)
+			os.Exit(1)
+		}
 	case "link":
 		ctl.CmdLink()
 	case "status":
